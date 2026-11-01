@@ -177,19 +177,27 @@ def decode_message(raw: str | bytes) -> dict[str, Any]:
     return value
 
 
-async def receive_until(ws: Any, wanted_func: str, timeout: int = 20) -> dict[str, Any]:
+async def receive_until(
+    ws: Any, wanted_func: str | set[str], timeout: int = 20
+) -> dict[str, Any]:
+    wanted_funcs = {wanted_func} if isinstance(wanted_func, str) else wanted_func
+    wanted_description = " 或 ".join(sorted(wanted_funcs))
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            raise TimeoutError(f"等待 {wanted_func} 逾時")
-        message = decode_message(await asyncio.wait_for(ws.recv(), remaining))
+            raise TimeoutError(f"等待 {wanted_description} 逾時")
+        try:
+            raw_message = await asyncio.wait_for(ws.recv(), remaining)
+        except TimeoutError as exc:
+            raise TimeoutError(f"等待 {wanted_description} 逾時") from exc
+        message = decode_message(raw_message)
         func = message.get("func")
         if func == "ping":
             await ws.send(json.dumps({"func": "ping"}, separators=(",", ":")))
             continue
-        if func == wanted_func:
+        if func in wanted_funcs:
             return message
         if message.get("status") == 0 or func in {"error", "send_error"}:
             raise ValueError(
@@ -231,8 +239,9 @@ async def websocket_booking(
             )
         )
 
-        # Wait for the initial reservation sync before adding a new one.
-        await receive_until(ws, "send_wb_rpd")
+        # Tanmo may omit send_wb_rpd when there are no reservations. In that
+        # case send_wb_acd is the final message in the initial device sync.
+        await receive_until(ws, {"send_wb_rpd", "send_wb_acd"})
 
         door_password = f"{secrets.randbelow(10000):04d}"
         await ws.send(
@@ -292,6 +301,126 @@ def parse_event(event: dict[str, Any]) -> tuple[int, int, int, str]:
     return device_id, begin, end, remark
 
 
+def parse_query_event(
+    event: dict[str, Any],
+) -> tuple[int, str | None, int | None, int | None]:
+    query = event.get("queryStringParameters") or {}
+    if not isinstance(query, dict):
+        raise RequestValidationError("query string 格式錯誤")
+
+    remark = query.get("remark")
+    raw_begin = query.get("begin")
+    raw_end = query.get("end")
+    has_remark = remark is not None
+    has_time = raw_begin is not None or raw_end is not None
+
+    if has_remark and has_time:
+        raise RequestValidationError("remark 與 begin/end 不可同時使用")
+    if has_remark:
+        if not isinstance(remark, str) or not remark:
+            raise RequestValidationError("remark 不可為空")
+        begin = None
+        end = None
+    elif has_time:
+        if raw_begin is None or raw_end is None:
+            raise RequestValidationError("begin 與 end 必須同時提供")
+        begin = parse_booking_datetime(raw_begin)
+        end = parse_booking_datetime(raw_end)
+        if begin >= end:
+            raise RequestValidationError("begin 必須早於 end")
+        remark = None
+    else:
+        raise RequestValidationError("必須提供 remark，或同時提供 begin 與 end")
+
+    raw_device_id = query.get("device_id", os.environ.get("TANMO_DEVICE_ID", "0"))
+    try:
+        device_id = int(raw_device_id)
+    except (TypeError, ValueError) as exc:
+        raise RequestValidationError("device_id 必須是整數") from exc
+    if device_id < 0:
+        raise RequestValidationError("device_id 不可小於 0")
+    return device_id, remark, begin, end
+
+
+def format_reservation(data: Any, device_id: int) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("Tanmo reservation 不是 JSON object")
+    try:
+        begin = int(data["beg"])
+        end = int(data["end"])
+        password = str(data["pass"]).zfill(4)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Tanmo reservation 缺少必要欄位") from exc
+
+    return {
+        "id": data.get("id"),
+        "password": password,
+        "remark": str(data.get("remark", "")),
+        "begin": format_booking_datetime(begin),
+        "end": format_booking_datetime(end),
+        "device_id": device_id,
+        "synced": str(data.get("sync", "0")) != "0",
+    }
+
+
+async def websocket_query_bookings(
+    token: str,
+    cookie_jar: CookieJar,
+    device_id: int,
+    remark: str | None,
+    begin: int | None,
+    end: int | None,
+) -> list[dict[str, Any]]:
+    headers: dict[str, str] = {}
+    cookies = cookie_header(cookie_jar)
+    if cookies:
+        headers["Cookie"] = cookies
+
+    async with websockets.connect(
+        WS_URL,
+        origin=ORIGIN,
+        additional_headers=headers,
+        user_agent_header=USER_AGENT,
+        open_timeout=15,
+        ping_interval=20,
+        ping_timeout=20,
+    ) as ws:
+        await ws.send(
+            json.dumps(
+                {
+                    "func": "web_dv_client",
+                    "devices": [{"id": device_id, "token": token}],
+                    "stamp": 0,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        message = await receive_until(ws, {"send_wb_rpd", "send_wb_acd"})
+        reservations = message.get("data", []) if message.get("func") == "send_wb_rpd" else []
+        if not isinstance(reservations, list):
+            raise ValueError("Tanmo reservation data 不是 array")
+
+        matches = []
+        for reservation in reservations:
+            if not isinstance(reservation, dict):
+                raise ValueError("Tanmo reservation 不是 JSON object")
+            if remark is not None and str(reservation.get("remark", "")) != remark:
+                continue
+            if begin is not None and end is not None:
+                try:
+                    matches_time = (
+                        int(reservation.get("beg")) == begin
+                        and int(reservation.get("end")) == end
+                    )
+                except (TypeError, ValueError):
+                    matches_time = False
+                if not matches_time:
+                    continue
+            matches.append(format_reservation(reservation, device_id))
+        return matches
+
+
 def api_response(
     status_code: int,
     body: dict[str, Any],
@@ -316,6 +445,7 @@ def api_response(
         "headers": {
             "Content-Type": "application/json; charset=utf-8",
             "Access-Control-Allow-Origin": allow_origin,
+            "Cache-Control": "no-store",
         },
         "body": json.dumps(body, ensure_ascii=False),
         "isBase64Encoded": False,
@@ -330,16 +460,32 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if not password:
             raise RuntimeError("Lambda environment variable TANMO_PASSWORD is missing")
 
-        device_id, begin, end, remark = parse_event(event)
-        login_info, token, cookie_jar = login(username, password)
-        booking = asyncio.run(
-            websocket_booking(token, cookie_jar, device_id, begin, end, remark)
-        )
-        return api_response(
-            201,
-            {"ok": True, "message": login_info, "booking": booking},
-            event,
-        )
+        method = str(event.get("httpMethod", "POST")).upper()
+        if method == "POST":
+            device_id, begin, end, remark = parse_event(event)
+            login_info, token, cookie_jar = login(username, password)
+            booking = asyncio.run(
+                websocket_booking(token, cookie_jar, device_id, begin, end, remark)
+            )
+            return api_response(
+                201,
+                {"ok": True, "message": login_info, "booking": booking},
+                event,
+            )
+        if method == "GET":
+            device_id, remark, begin, end = parse_query_event(event)
+            _, token, cookie_jar = login(username, password)
+            bookings = asyncio.run(
+                websocket_query_bookings(
+                    token, cookie_jar, device_id, remark, begin, end
+                )
+            )
+            return api_response(
+                200,
+                {"ok": True, "count": len(bookings), "bookings": bookings},
+                event,
+            )
+        return api_response(405, {"ok": False, "message": "Method not allowed"}, event)
     except RequestValidationError as exc:
         return api_response(400, {"ok": False, "message": str(exc)}, event)
     except HTTPError as exc:

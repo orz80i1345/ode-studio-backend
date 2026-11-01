@@ -155,13 +155,18 @@ export class BackendStack extends cdk.Stack {
           'X-Api-Key',
           'X-Amz-Security-Token',
         ],
-        allowMethods: ['POST', 'OPTIONS'],
+        allowMethods: ['GET', 'POST', 'OPTIONS'],
       },
     });
 
     const booking = api.root.addResource('booking');
     booking.addMethod(
       'POST',
+      new apigateway.LambdaIntegration(bookingFunction, { proxy: true }),
+      { apiKeyRequired },
+    );
+    booking.addMethod(
+      'GET',
       new apigateway.LambdaIntegration(bookingFunction, { proxy: true }),
       { apiKeyRequired },
     );
